@@ -1,5 +1,4 @@
 from fastapi import FastAPI, HTTPException
-from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -16,29 +15,27 @@ load_dotenv()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 PINECONE_API_KEY   = os.getenv("PINECONE_API_KEY")
 
-# ── Connect to services ───────────────────────────────
-
-# Load embedding model locally (free, no API needed)
+# ── Load embedding model locally ──────────────────────
 print("Loading embedding model...")
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
 print("Model loaded!")
 
-# Connect to Pinecone
-pc = Pinecone(api_key=PINECONE_API_KEY)
-
-# Create index if it doesn't exist
+# ── Connect to Pinecone ───────────────────────────────
+pc         = Pinecone(api_key=PINECONE_API_KEY)
 index_name = "rag-documents"
-if index_name not in pc.list_indexes().names():
+
+existing = [i.name for i in pc.list_indexes()]
+if index_name not in existing:
     pc.create_index(
         name=index_name,
-        dimension=384,         # all-MiniLM-L6-v2 produces 384-dimensional vectors
-        metric="cosine",       # cosine similarity for comparing vectors
+        dimension=384,
+        metric="cosine",
         spec={"serverless": {"cloud": "aws", "region": "us-east-1"}}
     )
 
-index = pc.Index(index_name)
+pinecone_index = pc.Index(index_name)
 
-# Connect to OpenRouter (uses OpenAI format)
+# ── Connect to OpenRouter ─────────────────────────────
 llm = OpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=OPENROUTER_API_KEY
@@ -54,7 +51,7 @@ app.add_middleware(
     allow_headers=["*"]
 )
 
-# ── Request models (FastAPI uses Pydantic for validation) ──
+# ── Request models ────────────────────────────────────
 class DocumentRequest(BaseModel):
     text: str
 
@@ -74,8 +71,8 @@ def chunk_text(text, chunk_size=500, overlap=50):
 
 # ── Route 1: Serve the HTML page ──────────────────────
 @app.get("/", response_class=HTMLResponse)
-async def index():
-    with open("templates/index.html") as f:
+async def serve_index():
+    with open("templates/index.html", encoding="utf-8") as f:
         return f.read()
 
 # ── Route 2: Upload and index a document ──────────────
@@ -84,22 +81,23 @@ async def upload_document(req: DocumentRequest):
     if not req.text.strip():
         raise HTTPException(status_code=400, detail="No text provided")
 
-    # Split document into chunks
+    # Split into chunks
     chunks = chunk_text(req.text)
 
-    # Generate embeddings for all chunks at once
+    # Generate embeddings for all chunks
     embeddings = embedder.encode(chunks).tolist()
 
-    # Store in Pinecone
+    # Build vectors for Pinecone
     vectors = []
-    for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+    for chunk, embedding in zip(chunks, embeddings):
         vectors.append({
             "id":       str(uuid.uuid4()),
             "values":   embedding,
             "metadata": {"text": chunk}
         })
 
-    index.upsert(vectors=vectors)
+    # Store in Pinecone
+    pinecone_index.upsert(vectors=vectors)
 
     return {
         "success": True,
@@ -117,17 +115,17 @@ async def query_document(req: QueryRequest):
     question_embedding = embedder.encode(req.question).tolist()
 
     # Search Pinecone for most relevant chunks
-    results = index.query(
+    results = pinecone_index.query(
         vector=question_embedding,
-        top_k=3,                # Get top 3 most relevant chunks
+        top_k=3,
         include_metadata=True
     )
 
-    # Extract the relevant text chunks
+    # Extract relevant chunks above similarity threshold
     relevant_chunks = [
         match["metadata"]["text"]
         for match in results["matches"]
-        if match["score"] > 0.3   # Only use chunks with >30% similarity
+        if match["score"] > 0.1
     ]
 
     if not relevant_chunks:
@@ -136,9 +134,9 @@ async def query_document(req: QueryRequest):
     # Build context from retrieved chunks
     context = "\n\n".join(relevant_chunks)
 
-    # Send to OpenRouter AI with context
+    # Send to OpenRouter AI
     response = llm.chat.completions.create(
-        model="meta-llama/llama-3.3-70b-instruct:free",
+        model="openrouter/auto",
         messages=[
             {
                 "role": "system",
@@ -166,5 +164,5 @@ Answer based only on the context above:"""
 # ── Route 4: Clear all documents ──────────────────────
 @app.delete("/clear")
 async def clear_documents():
-    index.delete(delete_all=True)
+    pinecone_index.delete(delete_all=True)
     return {"success": True, "message": "All documents cleared"}
